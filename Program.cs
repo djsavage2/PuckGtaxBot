@@ -10,6 +10,7 @@ using System.Text.Json;
 
 public class Program
 {
+    private static readonly CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
     static async Task Main(string[] args)
     {
         var services = new ServiceCollection();
@@ -17,6 +18,15 @@ public class Program
             .AddJsonFile("appsettings.json")
             .Build();
         services.AddSingleton(config);
+
+        Console.CancelKeyPress += (sender, e) =>
+        {
+            // Prevent immediate termination so the cleanup code can run
+            e.Cancel = true; 
+            _cancellationTokenSource.Cancel();
+            Log.Information("Shutdown requested. Closing and flushing logs...");
+            Log.CloseAndFlush();
+        };
 
         Log.Logger = new LoggerConfiguration()
             .MinimumLevel.Debug()
@@ -37,11 +47,22 @@ public class Program
         using var sp = services.BuildServiceProvider();
         var goalieBotLogger = sp.GetRequiredService<ILogger<GoalieTaxBot>>();
 
-        goalieBotLogger.LogInformation("Starting PuckGtaxBot...");
-
-        var bot = new GoalieTaxBot(goalieBotLogger);
-        await bot.RunAsync(config["Discord:Token"]);
-        await Task.Delay(-1);
+        try
+        {
+            goalieBotLogger.LogInformation("Starting PuckGtaxBot...");
+            var bot = new GoalieTaxBot(goalieBotLogger);
+            await bot.RunAsync(config["Discord:Token"]);
+            await Task.Delay(Timeout.Infinite, _cancellationTokenSource.Token); 
+        }
+        catch (TaskCanceledException)
+        {
+            Log.Information("Application successfully shut down.");
+        }
+        catch (Exception ex)
+        {
+            Log.Fatal(ex, "Application terminated unexpectedly");
+            Log.CloseAndFlush();
+        }
     }
 }
 
