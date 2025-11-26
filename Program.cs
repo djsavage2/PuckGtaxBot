@@ -10,27 +10,20 @@ using System.Text.Json;
 
 public class Program
 {
-    private static readonly CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
-    static async Task Main(string[] args)
+    private static readonly CancellationTokenSource _cancellationTokenSource = new();
+    static void Main(string[] args)
     {
-        var services = new ServiceCollection();
-        var config = new ConfigurationBuilder()
-            .AddJsonFile("appsettings.json")
-            .Build();
-        services.AddSingleton(config);
+        Console.WriteLine("Starting...");
 
         Console.CancelKeyPress += (sender, e) =>
         {
-            // Prevent immediate termination so the cleanup code can run
             e.Cancel = true; 
+            Log.Information("Shutdown requested.");
             _cancellationTokenSource.Cancel();
-            Log.Information("Shutdown requested. Closing and flushing logs...");
-            Log.CloseAndFlush();
         };
 
         Log.Logger = new LoggerConfiguration()
             .MinimumLevel.Debug()
-            .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
             .Enrich.FromLogContext()
             .WriteTo.Console()
             .WriteTo.File(
@@ -38,29 +31,70 @@ public class Program
                 rollingInterval: RollingInterval.Day, 
                 outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] [{SourceContext}] {Message:lj}{NewLine}{Exception}")
             .CreateLogger();
-        services.AddLogging(b => 
-        {
-            b.ClearProviders();
-            b.AddSerilog(dispose: true);
-        });
-
-        using var sp = services.BuildServiceProvider();
-        var goalieBotLogger = sp.GetRequiredService<ILogger<GoalieTaxBot>>();
+        Console.TreatControlCAsInput = false;
 
         try
         {
-            goalieBotLogger.LogInformation("Starting PuckGtaxBot...");
-            var bot = new GoalieTaxBot(goalieBotLogger);
-            await bot.RunAsync(config["Discord:Token"]);
-            await Task.Delay(Timeout.Infinite, _cancellationTokenSource.Token); 
-        }
-        catch (TaskCanceledException)
-        {
-            Log.Information("Application successfully shut down.");
+            // --- Dependency Injection container ---
+            var services = new ServiceCollection();
+
+            var config = new ConfigurationBuilder()
+                .AddJsonFile("appsettings.json")
+                .Build();
+            services.AddSingleton<IConfiguration>(config);
+
+            services.AddLogging(builder =>
+            {
+                builder.ClearProviders();
+                builder.AddSerilog();
+            });
+
+            using var provider = services.BuildServiceProvider();
+            var logger = provider.GetRequiredService<ILogger<GoalieTaxBot>>();
+
+            while (!_cancellationTokenSource.IsCancellationRequested)
+            {
+                try
+                {
+                    logger.LogInformation("Starting PuckGtaxBot...");
+                    var bot = new GoalieTaxBot(logger);
+
+                    bot.RunAsync(
+                        config["Discord:Token"],
+                        _cancellationTokenSource.Token
+                    )
+                    .GetAwaiter()
+                    .GetResult();
+
+                    if (!_cancellationTokenSource.IsCancellationRequested)
+                    {
+                        logger.LogWarning("Bot exited unexpectedly — restarting in 5 seconds...");
+                        Task.Delay(5000, _cancellationTokenSource.Token)
+                            .GetAwaiter()
+                            .GetResult();
+                    }
+                }
+                catch (TaskCanceledException)
+                {
+                    logger.LogInformation("Shutdown requested — stopping main loop.");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogCritical(ex, "Fatal error in bot loop — restarting in 5 seconds");
+                    Task.Delay(5000, _cancellationTokenSource.Token)
+                        .GetAwaiter()
+                        .GetResult();
+                }
+            }
         }
         catch (Exception ex)
         {
             Log.Fatal(ex, "Application terminated unexpectedly");
+        }
+        finally
+        {
+            Log.Information("Shutdown complete. Closing logs...");
             Log.CloseAndFlush();
         }
     }
@@ -79,7 +113,7 @@ public class GoalieTaxBot
         _logger = logger;
     }
 
-    public async Task RunAsync(string botToken)
+    public async Task RunAsync(string botToken, CancellationToken cancellationToken)
     {
         _client = new DiscordSocketClient(new DiscordSocketConfig
         {
@@ -93,20 +127,29 @@ public class GoalieTaxBot
         _client.ButtonExecuted += HandleButtonAsync;
 
         LoadConfig();
-
-        while (true)
+        try
         {
+            await _client.LoginAsync(TokenType.Bot, botToken);
+            await _client.StartAsync();
+
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        }
+        catch (TaskCanceledException)
+        {
+            
+        }
+        finally
+        {
+            _logger.LogInformation("Stopping Discord client...");
+
             try
             {
-                await _client.LoginAsync(TokenType.Bot, botToken);
-                await _client.StartAsync();
-            }
-            catch (Exception ex)
-            {
-                _logger.Log(LogLevel.Critical, $"A critical error occurred: {ex.Message}. Restarting bot in 10 seconds.");
-                await Task.Delay(10000);
-            }
-        }
+                await _client.StopAsync();
+            } catch { }
+            
+            _client.Dispose();
+            _logger.LogInformation("Discord client disposed. Shutdown complete.");
+        }   
     }
 
     private Task LogAsync(LogMessage logMessage)
